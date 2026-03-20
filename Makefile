@@ -1,4 +1,4 @@
-.PHONY: install lint format test pipeline clean
+.PHONY: install lint format test pipeline poc-reumap clean
 
 install:
 	uv sync --extra dev
@@ -21,6 +21,11 @@ pipeline:
 	uv run python pipeline/05_reduce_umap.py
 	uv run python pipeline/06_label_topics.py
 	uv run python pipeline/07_visualize.py
+
+poc-reumap:
+	uv run python experiments/poc_reumap_precompute.py
+	@echo "Open http://localhost:8000/experiments/poc_reumap.html"
+	uv run python -m http.server 8000
 
 clean:
 	@echo "This will remove all files in data/. Press Ctrl+C to cancel."

@@ -24,6 +24,10 @@ dependencies = [
 
 [project.optional-dependencies]
 bigquery = ["google-cloud-bigquery"]
+local-models = [
+    "sentence-transformers>=3.0",
+    "ollama>=0.4",
+]
 dev = [
     "ruff>=0.14",
     "pre-commit>=4.0",
@@ -43,3 +47,4 @@ select = ["E", "F", "I"]
 [tool.ruff.lint.per-file-ignores]
 "pipeline/06_label_topics.py" = ["E402"]
 "experiments/compare_toponymy_configs.py" = ["E402"]
+"experiments/local_models_toponymy.py" = ["E402"]

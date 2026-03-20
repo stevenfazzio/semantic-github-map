@@ -97,11 +97,11 @@ async function loadData() {
   const t0 = performance.now();
 
   const [embBuf, knnIdxBuf, knnDistBuf, coordsBuf, metaJson] = await Promise.all([
-    fetch('data/poc_embeddings.bin').then(r => r.arrayBuffer()),
-    fetch('data/poc_knn_indices.bin').then(r => r.arrayBuffer()),
-    fetch('data/poc_knn_distances.bin').then(r => r.arrayBuffer()),
-    fetch('data/poc_coords.bin').then(r => r.arrayBuffer()),
-    fetch('data/poc_metadata.json').then(r => r.json()),
+    fetch('../data/poc_embeddings.bin').then(r => r.arrayBuffer()),
+    fetch('../data/poc_knn_indices.bin').then(r => r.arrayBuffer()),
+    fetch('../data/poc_knn_distances.bin').then(r => r.arrayBuffer()),
+    fetch('../data/poc_coords.bin').then(r => r.arrayBuffer()),
+    fetch('../data/poc_metadata.json').then(r => r.json()),
   ]);
 
   embeddings = new Float32Array(embBuf);
@@ -259,6 +259,7 @@ function drawScatter(canvasId, pts, options = {}) {
 }
 
 function drawGlobalScatter(highlightSet = null, seedIdx = null) {
+  if (!coords) return;
   const pts = [];
   for (let i = 0; i < N; i++) {
     pts.push({ x: coords[i * 2], y: coords[i * 2 + 1] });
@@ -324,7 +325,8 @@ async function runUmap(subsetEmbeddings, nSubset, usePrecomputed, warmStartCoord
     spread: 1.0,
   };
 
-  const umap = new UMAP(opts);
+  const UMAPClass = window.UMAP.UMAP || window.UMAP;
+  const umap = new UMAPClass(opts);
 
   // Reshape embeddings to 2D array for umap-js
   const data = [];

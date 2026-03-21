@@ -27,6 +27,8 @@ bigquery = ["google-cloud-bigquery"]
 local-models = [
     "sentence-transformers>=3.0",
     "ollama>=0.4",
+    "mlx-lm>=0.20",
+    "openai>=1.0",
 ]
 dev = [
     "ruff>=0.14",

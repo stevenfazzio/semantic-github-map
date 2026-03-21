@@ -5,6 +5,9 @@ Cohere embeddings and UMAP coords). Tests 5 Ollama LLMs with sentence-transforme
 
 Phase 2 — Re-embed all 10K READMEs with local embedding models, re-run UMAP,
 and run Toponymy with the best LLM from Phase 1.
+
+MLX mode (--mlx) — Run qwen2.5-0.5B via MLX on Apple Silicon using Toponymy's
+AsyncOpenAINamer pointed at mlx_lm.server. Monkey-patches two bugs in the wrapper.
 """
 
 import argparse
@@ -24,7 +27,7 @@ from toponymy.audit import (
     create_keyphrase_analysis_df,
     create_layer_summary_df,
 )
-from toponymy.llm_wrappers import LLMWrapper
+from toponymy.llm_wrappers import AsyncOllamaNamer
 
 nest_asyncio.apply()
 
@@ -39,44 +42,6 @@ from pipeline.config import (
 LOCAL_MODELS_DIR = EXPERIMENTS_DIR / "local_models"
 LOCAL_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Ollama LLM wrapper ──────────────────────────────────────────────────────
-
-
-class OllamaLLMWrapper(LLMWrapper):
-    """Synchronous Toponymy LLM wrapper backed by a local Ollama model."""
-
-    def __init__(self, model: str, llm_specific_instructions: str | None = None):
-        import ollama
-
-        self.client = ollama.Client()
-        self.model = model
-        self.extra_prompting = "\n\n" + llm_specific_instructions if llm_specific_instructions else ""
-
-    def _call_llm(self, prompt: str, temperature: float, max_tokens: int) -> str:
-        import ollama
-
-        response = self.client.chat(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt + self.extra_prompting}],
-            options=ollama.Options(temperature=temperature, num_predict=max_tokens),
-        )
-        return response.message.content
-
-    def _call_llm_with_system_prompt(
-        self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int
-    ) -> str:
-        import ollama
-
-        response = self.client.chat(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt + self.extra_prompting},
-            ],
-            options=ollama.Options(temperature=temperature, num_predict=max_tokens),
-        )
-        return response.message.content
-
 
 # ── Sentence-transformers embedder for Toponymy ─────────────────────────────
 
@@ -84,19 +49,18 @@ class OllamaLLMWrapper(LLMWrapper):
 class SentenceTransformerEmbedder:
     """Drop-in replacement for CohereEmbedder using sentence-transformers.
 
-    Toponymy calls ``embedder.embed(texts, ...)`` and expects a list of lists
-    (or 2-D array) back.  We match that interface.
+    Toponymy calls ``embedder.encode(texts, show_progress_bar=...)`` on the
+    text_embedding_model. We wrap SentenceTransformer to match that interface.
     """
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         from sentence_transformers import SentenceTransformer
 
-        self.model = SentenceTransformer(model_name, trust_remote_code=True)
+        self._model = SentenceTransformer(model_name, trust_remote_code=True)
         self.model_name = model_name
 
-    def embed(self, texts, **kwargs):
-        embeddings = self.model.encode(texts, show_progress_bar=False)
-        return embeddings.tolist()
+    def encode(self, texts, show_progress_bar=False, **kwargs):
+        return self._model.encode(texts, show_progress_bar=show_progress_bar)
 
 
 # ── Experiment configs ───────────────────────────────────────────────────────
@@ -104,16 +68,20 @@ class SentenceTransformerEmbedder:
 PHASE1_EMBEDDER_MODEL = "all-MiniLM-L6-v2"
 
 PHASE1_EXPERIMENTS = [
-    {"name": "qwen3_0.6b", "ollama_model": "qwen3:0.6b"},
-    {"name": "smollm2_1.7b", "ollama_model": "smollm2:1.7b-instruct"},
-    {"name": "qwen3_1.7b", "ollama_model": "qwen3:1.7b"},
-    {"name": "llama3.2_3b", "ollama_model": "llama3.2:3b"},
-    {"name": "phi4_mini", "ollama_model": "phi4-mini:3.8b"},
+    {"name": "smollm2_135m", "ollama_model": "smollm2:135m"},
+    {"name": "smollm2_360m", "ollama_model": "smollm2:360m"},
+    {"name": "qwen2.5_0.5b", "ollama_model": "qwen2.5:0.5b"},
+    {"name": "smollm2_1.7b", "ollama_model": "smollm2:1.7b"},
+    {"name": "gemma3_1b", "ollama_model": "gemma3:1b"},
 ]
 
 PHASE2_EMBEDDING_MODELS = [
     {"name": "phase2_minilm", "model": "all-MiniLM-L6-v2"},
     {"name": "phase2_nomic", "model": "nomic-ai/nomic-embed-text-v1.5"},
+]
+
+MLX_EXPERIMENTS = [
+    {"name": "mlx_qwen2.5_0.5b", "mlx_model": "mlx-community/Qwen2.5-0.5B-Instruct-4bit"},
 ]
 
 # Toponymy settings (mirrors pipeline/06_label_topics.py)
@@ -247,8 +215,8 @@ def validate_preflight(df, embeddings, coords, phase2: bool = False):
     # Quick connectivity test with the smallest model
     print("Testing Ollama connectivity...")
     try:
-        wrapper = OllamaLLMWrapper(model=PHASE1_EXPERIMENTS[0]["ollama_model"])
-        result = wrapper._call_llm("Say hello in one word.", temperature=0.0, max_tokens=10)
+        wrapper = AsyncOllamaNamer(model=PHASE1_EXPERIMENTS[0]["ollama_model"])
+        result = wrapper.test_llm_connectivity("Say hello in one word.")
         print(f"  Ollama test response: {result.strip()!r}")
     except Exception as e:
         raise RuntimeError(f"Ollama connectivity test failed: {e}")
@@ -268,23 +236,45 @@ def extract_labels(model, documents):
     coarse_layer = model.cluster_layers_[-1]
     fine_layer = model.cluster_layers_[0]
 
-    coarse_labels = [coarse_layer.topic_name_vector[i] for i in range(len(documents))]
-    fine_labels = [fine_layer.topic_name_vector[i] for i in range(len(documents))]
+    coarse_labels = [str(coarse_layer.topic_name_vector[i]) for i in range(len(documents))]
+    fine_labels = [str(fine_layer.topic_name_vector[i]) for i in range(len(documents))]
     return coarse_labels, fine_labels
+
+
+def _sanitize_topic_names(model):
+    """Coerce any non-string topic names (e.g. dicts from Ollama) to strings."""
+    for layer in model.cluster_layers_:
+        if hasattr(layer, "topic_names"):
+            layer.topic_names = [str(t) if not isinstance(t, str) else t for t in layer.topic_names]
+        if hasattr(layer, "topic_name_vector"):
+            layer.topic_name_vector = [
+                str(t) if not isinstance(t, str) else t for t in layer.topic_name_vector
+            ]
 
 
 def save_audit_csvs(model, exp_dir):
     """Save audit CSVs for a fitted model."""
-    layer_summary = create_layer_summary_df(model)
-    layer_summary.to_csv(exp_dir / "audit_layer_summary.csv", index=False)
+    _sanitize_topic_names(model)
+
+    try:
+        layer_summary = create_layer_summary_df(model)
+        layer_summary.to_csv(exp_dir / "audit_layer_summary.csv", index=False)
+    except Exception as e:
+        print(f"  Warning: could not create layer summary: {e}")
 
     n_layers = len(model.cluster_layers_)
     for i in range(n_layers):
-        comp = create_comparison_df(model, layer_index=i)
-        comp.to_csv(exp_dir / f"audit_comparison_layer{i}.csv", index=False)
+        try:
+            comp = create_comparison_df(model, layer_index=i)
+            comp.to_csv(exp_dir / f"audit_comparison_layer{i}.csv", index=False)
+        except Exception as e:
+            print(f"  Warning: could not create comparison for layer {i}: {e}")
 
-        kp = create_keyphrase_analysis_df(model, layer_index=i)
-        kp.to_csv(exp_dir / f"audit_keyphrase_layer{i}.csv", index=False)
+        try:
+            kp = create_keyphrase_analysis_df(model, layer_index=i)
+            kp.to_csv(exp_dir / f"audit_keyphrase_layer{i}.csv", index=False)
+        except Exception as e:
+            print(f"  Warning: could not create keyphrase analysis for layer {i}: {e}")
 
 
 def run_single_experiment(
@@ -326,6 +316,8 @@ def run_single_experiment(
     )
     elapsed = time.time() - start
     print(f"  Toponymy fit completed in {elapsed:.1f}s")
+
+    _sanitize_topic_names(topic_model)
 
     # Save labels
     coarse_labels, fine_labels = extract_labels(topic_model, documents)
@@ -386,7 +378,7 @@ def run_phase1(df, embeddings, coords, documents, resume=False):
             print(f"{'=' * 60}")
             continue
 
-        llm = OllamaLLMWrapper(model=exp["ollama_model"])
+        llm = AsyncOllamaNamer(model=exp["ollama_model"])
         run_single_experiment(
             name=name,
             llm_wrapper=llm,
@@ -474,7 +466,7 @@ def run_phase2(df, documents, resume=False):
 
         # Toponymy
         embedder = SentenceTransformerEmbedder(model_name=emb_cfg["model"])
-        llm = OllamaLLMWrapper(model=best_llm_name)
+        llm = AsyncOllamaNamer(model=best_llm_name)
 
         base_clusterer = ToponymyClusterer(min_clusters=TOPONYMY_DEFAULTS["min_clusters"])
         base_clusterer.fit(clusterable_vectors=local_coords, embedding_vectors=local_embeddings)
@@ -497,14 +489,183 @@ def run_phase2(df, documents, resume=False):
             f.write(f"umap: {umap_time:.1f}s\n")
 
 
+# ── MLX experiment runner ────────────────────────────────────────────────────
+
+
+def _start_mlx_server(mlx_model: str) -> subprocess.Popen:
+    """Start mlx_lm.server as a subprocess and wait for readiness."""
+    import urllib.request
+
+    print(f"Starting mlx_lm.server with model {mlx_model}...")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "mlx_lm.server", "--model", mlx_model, "--port", "8080"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # Poll for readiness (up to 120s for model download/load)
+    for i in range(120):
+        time.sleep(1)
+        if proc.poll() is not None:
+            stderr = proc.stderr.read().decode() if proc.stderr else ""
+            raise RuntimeError(f"mlx_lm.server exited early (code {proc.returncode}):\n{stderr}")
+        try:
+            req = urllib.request.Request("http://localhost:8080/v1/models")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.status == 200:
+                    print(f"  mlx_lm.server ready after {i + 1}s")
+                    return proc
+        except Exception:
+            pass
+
+    proc.terminate()
+    raise RuntimeError("mlx_lm.server did not become ready within 120s")
+
+
+def _stop_mlx_server(proc: subprocess.Popen) -> None:
+    """Gracefully stop the mlx_lm.server subprocess."""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    print("  mlx_lm.server stopped")
+
+
+def _monkey_patch_async_openai_namer():
+    """Monkey-patch AsyncOpenAINamer to fix base_url forwarding and json_object mode.
+
+    Bug 1: __init__ doesn't pass base_url to openai.AsyncOpenAI.
+    Bug 2: _call_single_llm and _call_single_llm_with_system hardcode
+            response_format={"type": "json_object"} which small local models don't support.
+    """
+    import asyncio
+    import os
+    from warnings import warn
+
+    import openai
+    from toponymy.llm_wrappers import AsyncOpenAINamer
+
+    def patched_init(self, api_key=None, model="gpt-4o-mini", llm_specific_instructions=None,
+                     max_concurrent_requests=10, organization=None, base_url=None):
+        api_key = api_key or os.getenv("OPENAI_API_KEY") or "fake"
+        self.client = openai.AsyncOpenAI(
+            api_key=api_key,
+            organization=organization,
+            base_url=base_url,
+        )
+        self.model = model
+        self.extra_prompting = "\n\n" + llm_specific_instructions if llm_specific_instructions else ""
+        self.semaphore = asyncio.Semaphore(max_concurrent_requests)
+
+    AsyncOpenAINamer.__init__ = patched_init
+
+    async def patched_call_single_llm(self, prompt, temperature, max_tokens):
+        try:
+            async with self.semaphore:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt + self.extra_prompting}],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return response.choices[0].message.content
+        except Exception as e:
+            warn(f"OpenAI API call failed: {str(e)[:100]}...")
+            return ""
+
+    AsyncOpenAINamer._call_single_llm = patched_call_single_llm
+
+    async def patched_call_single_llm_with_system(self, system_prompt, user_prompt, temperature, max_tokens):
+        try:
+            async with self.semaphore:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt + self.extra_prompting},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return response.choices[0].message.content
+        except Exception as e:
+            warn(f"OpenAI API call failed: {str(e)[:100]}...")
+            return ""
+
+    AsyncOpenAINamer._call_single_llm_with_system = patched_call_single_llm_with_system
+
+    print("  Monkey-patched AsyncOpenAINamer (base_url + no json_object mode)")
+
+
+def run_mlx_experiments(df, embeddings, coords, documents, resume=False):
+    """Run MLX experiments: qwen2.5-0.5B via mlx_lm.server + AsyncOpenAINamer."""
+    from toponymy.llm_wrappers import AsyncOpenAINamer
+
+    print("\n" + "=" * 60)
+    print("MLX EXPERIMENTS: Local models via mlx_lm.server")
+    print("=" * 60)
+
+    # Check mlx_lm is available
+    try:
+        import mlx_lm  # noqa: F401
+
+        print("  mlx_lm is installed")
+    except ImportError:
+        print("ERROR: mlx_lm not installed. Run: uv sync --extra local-models")
+        sys.exit(1)
+
+    _monkey_patch_async_openai_namer()
+
+    embedder = SentenceTransformerEmbedder(model_name=PHASE1_EMBEDDER_MODEL)
+    print(f"Loaded sentence-transformers embedder: {PHASE1_EMBEDDER_MODEL}")
+
+    base_clusterer = ToponymyClusterer(min_clusters=TOPONYMY_DEFAULTS["min_clusters"])
+    base_clusterer.fit(clusterable_vectors=coords, embedding_vectors=embeddings)
+
+    for exp in MLX_EXPERIMENTS:
+        name = exp["name"]
+        exp_dir = LOCAL_MODELS_DIR / name
+
+        if resume and (exp_dir / "labels.parquet").exists():
+            print(f"\nSkipping (resume): {name}")
+            continue
+
+        server_proc = _start_mlx_server(exp["mlx_model"])
+        try:
+            llm = AsyncOpenAINamer(
+                api_key="fake",
+                model="default",
+                base_url="http://localhost:8080/v1",
+            )
+
+            run_single_experiment(
+                name=name,
+                llm_wrapper=llm,
+                embedder=embedder,
+                df=df,
+                embeddings=embeddings,
+                coords=coords,
+                documents=documents,
+                base_clusterer=base_clusterer,
+                exp_dir=exp_dir,
+            )
+        finally:
+            _stop_mlx_server(server_proc)
+
+
 # ── Comparison ───────────────────────────────────────────────────────────────
 
 
-def compare_experiments(include_phase2: bool = False):
+def compare_experiments(include_phase2: bool = False, include_mlx: bool = False):
     """Compare all completed experiments and write summary."""
     all_experiments = list(PHASE1_EXPERIMENTS)
     if include_phase2:
         all_experiments += [{"name": e["name"]} for e in PHASE2_EMBEDDING_MODELS]
+    if include_mlx:
+        all_experiments += [{"name": e["name"]} for e in MLX_EXPERIMENTS]
 
     experiment_names = []
     for exp in all_experiments:
@@ -673,19 +834,24 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate local models for Toponymy topic naming")
     parser.add_argument("--resume", action="store_true", help="Skip experiments with existing labels.parquet")
     parser.add_argument("--phase2", action="store_true", help="Also run Phase 2: local embeddings + UMAP")
+    parser.add_argument("--mlx", action="store_true", help="Run MLX experiments (Apple Silicon, mlx_lm.server)")
     args = parser.parse_args()
 
     df, embeddings, coords, documents = load_data()
     print(f"Loaded {len(documents)} documents")
 
-    validate_preflight(df, embeddings, coords, phase2=args.phase2)
+    if args.mlx:
+        # MLX-only mode: skip Ollama preflight, run MLX experiments
+        run_mlx_experiments(df, embeddings, coords, documents, resume=args.resume)
+        compare_experiments(include_mlx=True)
+    else:
+        validate_preflight(df, embeddings, coords, phase2=args.phase2)
+        run_phase1(df, embeddings, coords, documents, resume=args.resume)
 
-    run_phase1(df, embeddings, coords, documents, resume=args.resume)
+        if args.phase2:
+            run_phase2(df, documents, resume=args.resume)
 
-    if args.phase2:
-        run_phase2(df, documents, resume=args.resume)
-
-    compare_experiments(include_phase2=args.phase2)
+        compare_experiments(include_phase2=args.phase2)
 
     print("\nDone.")
 

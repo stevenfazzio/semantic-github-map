@@ -27,7 +27,7 @@ from toponymy.audit import (
     create_keyphrase_analysis_df,
     create_layer_summary_df,
 )
-from toponymy.llm_wrappers import AsyncOllamaNamer
+from toponymy.llm_wrappers import AsyncOllamaNamer, LLMWrapper
 
 nest_asyncio.apply()
 
@@ -492,120 +492,63 @@ def run_phase2(df, documents, resume=False):
 # ── MLX experiment runner ────────────────────────────────────────────────────
 
 
-def _start_mlx_server(mlx_model: str) -> subprocess.Popen:
-    """Start mlx_lm.server as a subprocess and wait for readiness."""
-    import urllib.request
+class MLXLocalNamer(LLMWrapper):
+    """Synchronous LLM wrapper using mlx_lm.generate() in-process.
 
-    print(f"Starting mlx_lm.server with model {mlx_model}...")
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "mlx_lm.server", "--model", mlx_model, "--port", "8080"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    # Poll for readiness (up to 120s for model download/load)
-    for i in range(120):
-        time.sleep(1)
-        if proc.poll() is not None:
-            stderr = proc.stderr.read().decode() if proc.stderr else ""
-            raise RuntimeError(f"mlx_lm.server exited early (code {proc.returncode}):\n{stderr}")
-        try:
-            req = urllib.request.Request("http://localhost:8080/v1/models")
-            with urllib.request.urlopen(req, timeout=2) as resp:
-                if resp.status == 200:
-                    print(f"  mlx_lm.server ready after {i + 1}s")
-                    return proc
-        except Exception:
-            pass
-
-    proc.terminate()
-    raise RuntimeError("mlx_lm.server did not become ready within 120s")
-
-
-def _stop_mlx_server(proc: subprocess.Popen) -> None:
-    """Gracefully stop the mlx_lm.server subprocess."""
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-    print("  mlx_lm.server stopped")
-
-
-def _monkey_patch_async_openai_namer():
-    """Monkey-patch AsyncOpenAINamer to fix base_url forwarding and json_object mode.
-
-    Bug 1: __init__ doesn't pass base_url to openai.AsyncOpenAI.
-    Bug 2: _call_single_llm and _call_single_llm_with_system hardcode
-            response_format={"type": "json_object"} which small local models don't support.
+    Runs the model directly on Apple Silicon via MLX — no HTTP server needed.
+    Avoids async deadlocks and server freezes that occur with mlx_lm.server.
     """
-    import asyncio
-    import os
-    from warnings import warn
 
-    import openai
-    from toponymy.llm_wrappers import AsyncOpenAINamer
+    supports_system_prompts = True
 
-    def patched_init(self, api_key=None, model="gpt-4o-mini", llm_specific_instructions=None,
-                     max_concurrent_requests=10, organization=None, base_url=None):
-        api_key = api_key or os.getenv("OPENAI_API_KEY") or "fake"
-        self.client = openai.AsyncOpenAI(
-            api_key=api_key,
-            organization=organization,
-            base_url=base_url,
+    def __init__(self, mlx_model_name: str):
+        from mlx_lm import load
+
+        print(f"  Loading MLX model: {mlx_model_name}...")
+        self._model, self._tokenizer = load(mlx_model_name)
+        self._model_name = mlx_model_name
+        print("  MLX model loaded")
+
+    def _call_llm(self, prompt: str, temperature: float, max_tokens: int) -> str:
+        messages = [{"role": "user", "content": prompt}]
+        return self._generate(messages, temperature, max_tokens)
+
+    def _call_llm_with_system_prompt(
+        self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int
+    ) -> str:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        return self._generate(messages, temperature, max_tokens)
+
+    def _generate(self, messages, temperature, max_tokens):
+        from mlx_lm import generate
+
+        prompt_str = self._tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
         )
-        self.model = model
-        self.extra_prompting = "\n\n" + llm_specific_instructions if llm_specific_instructions else ""
-        self.semaphore = asyncio.Semaphore(max_concurrent_requests)
-
-    AsyncOpenAINamer.__init__ = patched_init
-
-    async def patched_call_single_llm(self, prompt, temperature, max_tokens):
         try:
-            async with self.semaphore:
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt + self.extra_prompting}],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                return response.choices[0].message.content
+            return generate(
+                self._model,
+                self._tokenizer,
+                prompt=prompt_str,
+                max_tokens=max_tokens,
+            )
         except Exception as e:
-            warn(f"OpenAI API call failed: {str(e)[:100]}...")
+            from warnings import warn
+
+            warn(f"MLX generate failed: {e!s:.100}")
             return ""
 
-    AsyncOpenAINamer._call_single_llm = patched_call_single_llm
-
-    async def patched_call_single_llm_with_system(self, system_prompt, user_prompt, temperature, max_tokens):
-        try:
-            async with self.semaphore:
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt + self.extra_prompting},
-                    ],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                return response.choices[0].message.content
-        except Exception as e:
-            warn(f"OpenAI API call failed: {str(e)[:100]}...")
-            return ""
-
-    AsyncOpenAINamer._call_single_llm_with_system = patched_call_single_llm_with_system
-
-    print("  Monkey-patched AsyncOpenAINamer (base_url + no json_object mode)")
+    def test_llm_connectivity(self, prompt="Say hello in one word."):
+        return self._call_llm(prompt, temperature=0.0, max_tokens=10)
 
 
 def run_mlx_experiments(df, embeddings, coords, documents, resume=False):
-    """Run MLX experiments: qwen2.5-0.5B via mlx_lm.server + AsyncOpenAINamer."""
-    from toponymy.llm_wrappers import AsyncOpenAINamer
-
+    """Run MLX experiments: qwen2.5-0.5B via mlx_lm in-process on Apple Silicon."""
     print("\n" + "=" * 60)
-    print("MLX EXPERIMENTS: Local models via mlx_lm.server")
+    print("MLX EXPERIMENTS: Local models via mlx_lm (in-process)")
     print("=" * 60)
 
     # Check mlx_lm is available
@@ -616,8 +559,6 @@ def run_mlx_experiments(df, embeddings, coords, documents, resume=False):
     except ImportError:
         print("ERROR: mlx_lm not installed. Run: uv sync --extra local-models")
         sys.exit(1)
-
-    _monkey_patch_async_openai_namer()
 
     embedder = SentenceTransformerEmbedder(model_name=PHASE1_EMBEDDER_MODEL)
     print(f"Loaded sentence-transformers embedder: {PHASE1_EMBEDDER_MODEL}")
@@ -633,27 +574,23 @@ def run_mlx_experiments(df, embeddings, coords, documents, resume=False):
             print(f"\nSkipping (resume): {name}")
             continue
 
-        server_proc = _start_mlx_server(exp["mlx_model"])
-        try:
-            llm = AsyncOpenAINamer(
-                api_key="fake",
-                model="default",
-                base_url="http://localhost:8080/v1",
-            )
+        llm = MLXLocalNamer(mlx_model_name=exp["mlx_model"])
 
-            run_single_experiment(
-                name=name,
-                llm_wrapper=llm,
-                embedder=embedder,
-                df=df,
-                embeddings=embeddings,
-                coords=coords,
-                documents=documents,
-                base_clusterer=base_clusterer,
-                exp_dir=exp_dir,
-            )
-        finally:
-            _stop_mlx_server(server_proc)
+        # Quick connectivity test
+        test_result = llm.test_llm_connectivity()
+        print(f"  MLX test response: {test_result.strip()!r}")
+
+        run_single_experiment(
+            name=name,
+            llm_wrapper=llm,
+            embedder=embedder,
+            df=df,
+            embeddings=embeddings,
+            coords=coords,
+            documents=documents,
+            base_clusterer=base_clusterer,
+            exp_dir=exp_dir,
+        )
 
 
 # ── Comparison ───────────────────────────────────────────────────────────────

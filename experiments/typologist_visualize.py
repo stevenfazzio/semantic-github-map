@@ -1,21 +1,25 @@
-"""Render a DataMapPlot of the same top-500 docs that typologist_vanilla.py fit,
+"""Render a DataMapPlot of the top-500 docs that the typologist runs fit,
 with Typologist's discovered facets as selectable colormaps and Toponymy's
 hierarchical labels as the region labels.
 
 Inputs:
   - data/repos.parquet, data/umap_coords.npz, data/labels.parquet  (main pipeline)
-  - data/experiments/typologist_vanilla/{schema.json, labels.parquet}
+  - data/experiments/typologist_<name>/{schema.json, labels.parquet}
 
 Output:
-  - data/experiments/typologist_vanilla/map.html
+  - data/experiments/typologist_<name>/map.html
 
 Runs in the main project venv (no typologist/toponymy import at runtime, just
 DataMapPlot consuming the saved outputs):
-    uv run python experiments/typologist_visualize.py
+    uv run python experiments/typologist_visualize.py                  # vanilla
+    uv run python experiments/typologist_visualize.py --exp lang_erased
+    uv run python experiments/typologist_visualize.py --exp all        # render every
+                                                                       # experiment dir found
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -34,10 +38,8 @@ from pipeline.config import (  # noqa: E402
     UMAP_COORDS_NPZ,
 )
 
-EXPERIMENT_DIR = DATA_DIR / "experiments" / "typologist_vanilla"
-TYPOLOGIST_LABELS = EXPERIMENT_DIR / "labels.parquet"
-TYPOLOGIST_SCHEMA = EXPERIMENT_DIR / "schema.json"
-OUTPUT_HTML = EXPERIMENT_DIR / "map.html"
+EXPERIMENTS_BASE = DATA_DIR / "experiments"
+EXPERIMENT_PREFIX = "typologist_"
 
 N_DOCS = 500
 
@@ -53,36 +55,30 @@ def _align_by_full_name(side: pd.DataFrame, full_names: pd.Series) -> pd.DataFra
     return side.set_index("full_name").loc[full_names.values].reset_index()
 
 
-def main() -> None:
-    if not TYPOLOGIST_LABELS.exists() or not TYPOLOGIST_SCHEMA.exists():
+def _render_one(
+    exp_name: str,
+    df: pd.DataFrame,
+    coords: np.ndarray,
+    label_layers: list,
+) -> None:
+    exp_dir = EXPERIMENTS_BASE / f"{EXPERIMENT_PREFIX}{exp_name}"
+    schema_path = exp_dir / "schema.json"
+    labels_path = exp_dir / "labels.parquet"
+    output_html = exp_dir / "map.html"
+
+    if not schema_path.exists() or not labels_path.exists():
         raise FileNotFoundError(
-            f"Missing Typologist outputs in {EXPERIMENT_DIR}. "
-            "Run `uv run experiments/typologist_vanilla.py` first."
+            f"Missing Typologist outputs in {exp_dir}. "
+            "Run the matching fit script first (typologist_vanilla.py or "
+            "typologist_experiments.py)."
         )
 
-    df_all = pd.read_parquet(REPOS_PARQUET)
-    coords_all = np.load(UMAP_COORDS_NPZ)["coords"]
-    toponymy_all = pd.read_parquet(LABELS_PARQUET)
-
-    df, coords = _select_top_n(df_all, coords_all, N_DOCS)
-
-    # Toponymy labels (10K-fit, sliced to the same 500 by full_name).
-    toponymy = _align_by_full_name(toponymy_all, df["full_name"])
-    layer_cols = sorted(
-        (c for c in toponymy.columns if c.startswith("label_layer_")),
-        key=lambda c: int(c.split("_")[-1]),
-    )
-    if not layer_cols:
-        raise RuntimeError(f"No label_layer_* columns found in {LABELS_PARQUET}")
-    label_layers = [toponymy[c].values for c in layer_cols]
-
-    # Typologist labels and schema.
-    typologist = _align_by_full_name(pd.read_parquet(TYPOLOGIST_LABELS), df["full_name"])
-    schema = json.loads(TYPOLOGIST_SCHEMA.read_text())
+    typologist = _align_by_full_name(pd.read_parquet(labels_path), df["full_name"])
+    schema = json.loads(schema_path.read_text())
     facet_names = [f["name"] for f in schema]
     missing = [n for n in facet_names if n not in typologist.columns]
     if missing:
-        raise RuntimeError(f"Schema names not in labels.parquet: {missing}")
+        raise RuntimeError(f"[{exp_name}] Schema names not in labels.parquet: {missing}")
 
     # ── Colormaps: one per facet, glasbey palette per category set ──────────
     rawdata: list[np.ndarray] = []
@@ -170,16 +166,66 @@ def main() -> None:
         on_click="window.open(`https://github.com/{full_name}`,'_blank')",
         colormap_rawdata=rawdata,
         colormap_metadata=metadata,
-        title="Typologist Facets — Top 500 GitHub Repos",
-        sub_title=f"{N_DOCS} most-starred repositories, colored by discovered facets",
+        title=f"Typologist Facets ({exp_name})",
+        sub_title=f"Top {N_DOCS} most-starred GitHub repositories, colored by discovered facets",
         enable_search=True,
         search_field="",
         custom_css=custom_css,
         font_family="IBM Plex Sans",
         darkmode=False,
     )
-    fig.save(str(OUTPUT_HTML))
-    print(f"Saved interactive map → {OUTPUT_HTML}")
+    fig.save(str(output_html))
+    print(f"[{exp_name}] Saved → {output_html}")
+
+
+def _discover_experiments() -> list[str]:
+    """Find all data/experiments/typologist_*/ dirs that have a schema.json."""
+    if not EXPERIMENTS_BASE.exists():
+        return []
+    found = []
+    for child in sorted(EXPERIMENTS_BASE.iterdir()):
+        if child.is_dir() and child.name.startswith(EXPERIMENT_PREFIX):
+            if (child / "schema.json").exists() and (child / "labels.parquet").exists():
+                found.append(child.name[len(EXPERIMENT_PREFIX):])
+    return found
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--exp",
+        type=str,
+        default="vanilla",
+        help='Experiment name (e.g. "vanilla", "lang_erased") or "all" to render every '
+        "experiment dir found under data/experiments/.",
+    )
+    args = parser.parse_args()
+
+    df_all = pd.read_parquet(REPOS_PARQUET)
+    coords_all = np.load(UMAP_COORDS_NPZ)["coords"]
+    toponymy_all = pd.read_parquet(LABELS_PARQUET)
+
+    df, coords = _select_top_n(df_all, coords_all, N_DOCS)
+    toponymy = _align_by_full_name(toponymy_all, df["full_name"])
+    layer_cols = sorted(
+        (c for c in toponymy.columns if c.startswith("label_layer_")),
+        key=lambda c: int(c.split("_")[-1]),
+    )
+    if not layer_cols:
+        raise RuntimeError(f"No label_layer_* columns found in {LABELS_PARQUET}")
+    label_layers = [toponymy[c].values for c in layer_cols]
+
+    if args.exp == "all":
+        names = _discover_experiments()
+        if not names:
+            print(f"No typologist experiments found under {EXPERIMENTS_BASE}")
+            return
+        print(f"Rendering {len(names)} experiment(s): {names}")
+    else:
+        names = [args.exp]
+
+    for name in names:
+        _render_one(name, df, coords, label_layers)
 
 
 if __name__ == "__main__":

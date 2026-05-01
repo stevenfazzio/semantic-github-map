@@ -17,13 +17,17 @@ DataMapPlot consuming the saved outputs):
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
 
 import datamapplot
 import glasbey
 import numpy as np
 import pandas as pd
 
-from pipeline.config import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from pipeline.config import (  # noqa: E402
     DATA_DIR,
     LABELS_PARQUET,
     REPOS_PARQUET,

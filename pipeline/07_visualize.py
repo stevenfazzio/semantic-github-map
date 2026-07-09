@@ -338,9 +338,12 @@ def main():
     # Build edge bundle background image
     edge_bundle_kwargs = _build_edge_bundle(coords, embeddings)
 
-    # Collect all label layers (label_layer_0 = coarsest, label_layer_1, ... = finer)
+    # Collect all label layers (label_layer_0 = coarsest, label_layer_1, ... = finer).
+    # DataMapPlot wants label layers FINEST-first (create_interactive_plot
+    # docstring); passing coarsest-first inverts label zoom gating so fine
+    # names crowd out coarse region names at overview zoom (fixed 2026-07-09).
     label_columns = sorted(c for c in labels_df.columns if c.startswith("label_layer_"))
-    topic_name_vectors = [labels_df[c].values for c in label_columns]
+    topic_name_vectors = [labels_df[c].values for c in reversed(label_columns)]
 
     # ── Hover text ───────────────────────────────────────────────────────────
     has_forks = "fork_count" in df.columns

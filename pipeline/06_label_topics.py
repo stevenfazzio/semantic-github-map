@@ -99,8 +99,10 @@ def main():
         clusterable_vectors=coords,
     )
 
-    # Extract per-document labels from all cluster layers
-    # Layer 0 is finest, last layer is coarsest — DataMapPlot expects coarsest first
+    # Extract per-document labels from all cluster layers.
+    # cluster_layers_[0] is finest; the parquet stores label_layer_0 = coarsest.
+    # NOTE: DataMapPlot itself expects FINEST-first -- stage 07 reverses at the
+    # call site. (The old comment "DataMapPlot expects coarsest first" was wrong.)
     n_layers = len(topic_model.cluster_layers_)
     if n_layers == 0:
         raise ValueError("No cluster layers found")

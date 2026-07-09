@@ -84,7 +84,9 @@ Stage 08 caps each source repo at 30 manifests (`MAX_MANIFEST_PAGES = 10` * `MAN
 
 ## Visualization Details
 
-`pipeline/07_visualize.py` produces the main output — an interactive HTML map with multiple colormaps (language, stars, license, age), hover tooltips with summaries, click-to-open-repo, and search. Toponymy's hierarchical cluster layers are passed directly to DataMapPlot for multi-level topic label display.
+`pipeline/07_visualize.py` produces the main output — an interactive HTML map with multiple colormaps (language, stars, license, age), hover tooltips with summaries, click-to-open-repo, and search. Toponymy's hierarchical cluster layers are passed to DataMapPlot for multi-level topic label display.
+
+**Label layer order (fixed 2026-07-09):** `create_interactive_plot` expects label layers FINEST-first, coarsest last (its docstring). `labels.parquet` stores `label_layer_0` = coarsest, so stage 07 reverses at the call site. The repo originally passed coarsest-first (the old stage-06 comment asserting "DataMapPlot expects coarsest first" was wrong), which inverted label zoom gating so hyper-specific labels dominated the overview zoom.
 
 ## docs/ Directory: Source vs. Generated Files
 

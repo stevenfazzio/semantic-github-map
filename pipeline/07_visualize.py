@@ -342,8 +342,15 @@ def main():
     # DataMapPlot wants label layers FINEST-first (create_interactive_plot
     # docstring); passing coarsest-first inverts label zoom gating so fine
     # names crowd out coarse region names at overview zoom (fixed 2026-07-09).
-    label_columns = sorted(c for c in labels_df.columns if c.startswith("label_layer_"))
+    label_columns = sorted(
+        (c for c in labels_df.columns if c.startswith("label_layer_")),
+        key=lambda s: int(s.rsplit("_", 1)[1]),  # numeric: lexicographic sorts _10 before _2
+    )
     topic_name_vectors = [labels_df[c].values for c in reversed(label_columns)]
+    # Convention-agnostic guard: the finest layer always has more unique names.
+    n_finest = pd.Series(topic_name_vectors[0]).nunique()
+    n_coarsest = pd.Series(topic_name_vectors[-1]).nunique()
+    assert n_finest >= n_coarsest, "label layers must be finest-first for DataMapPlot"
 
     # ── Hover text ───────────────────────────────────────────────────────────
     has_forks = "fork_count" in df.columns
